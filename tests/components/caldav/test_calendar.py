@@ -25,7 +25,7 @@ from homeassistant.components.calendar import (
     DOMAIN as CALENDAR_DOMAIN,
     CalendarEntityFeature,
 )
-from homeassistant.const import STATE_OFF, STATE_ON, Platform
+from homeassistant.const import ATTR_SUPPORTED_FEATURES, STATE_OFF, STATE_ON, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
@@ -1720,7 +1720,9 @@ async def test_custom_calendar_is_create_only(
 
     state = hass.states.get("calendar.example_work")
     assert state
-    assert state.attributes["supported_features"] == CalendarEntityFeature.CREATE_EVENT
+    assert (
+        state.attributes[ATTR_SUPPORTED_FEATURES] == CalendarEntityFeature.CREATE_EVENT
+    )
     client = await ws_client()
     resp = await client.cmd(
         "delete", {"entity_id": "calendar.example_work", "uid": "0"}

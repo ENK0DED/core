@@ -54,13 +54,13 @@
       "message": "The event was not found on the CalDAV server"
     },
     "event_not_supported": {
-      "message": "The event repeats in a way that Home Assistant can't change"
+      "message": "The event uses iCalendar features that Home Assistant can't change"
     },
     "occurrence_not_found": {
       "message": "The occurrence was not found in the event"
     },
     "occurrences_without_series": {
-      "message": "The occurrences of this event have no repeat rule, so they can only be changed one at a time"
+      "message": "This occurrence isn't part of a repeat rule, so it can only be changed on its own"
     },
     "recurrence_too_dense": {
       "message": "The event repeats too often to be changed"

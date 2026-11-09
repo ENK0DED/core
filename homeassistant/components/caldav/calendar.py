@@ -344,11 +344,7 @@ class WebDavCalendarEntity(CoordinatorEntity[CalDavUpdateCoordinator], CalendarE
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="event_changed"
                 ) from err
-            except (
-                caldav_requests.exceptions.ConnectionError,
-                caldav_requests.exceptions.Timeout,
-                DAVError,
-            ) as err:
+            except (caldav_requests.exceptions.RequestException, DAVError) as err:
                 raise HomeAssistantError(
                     translation_domain=DOMAIN, translation_key="request_error"
                 ) from err
@@ -393,14 +389,11 @@ class WebDavCalendarEntity(CoordinatorEntity[CalDavUpdateCoordinator], CalendarE
         try:
             _save_item(item)
         except DAVError:
-            # The server refused the change, so the split off copy is removed
+            # Without a response the change may be saved, so the copy is only
+            # removed when the server answered
             try:
                 new_item.delete()
-            except (
-                caldav_requests.exceptions.ConnectionError,
-                caldav_requests.exceptions.Timeout,
-                DAVError,
-            ):
+            except caldav_requests.exceptions.RequestException, DAVError:
                 _LOGGER.warning(
                     "Could not remove %s after a failed change, its occurrences may"
                     " show twice",

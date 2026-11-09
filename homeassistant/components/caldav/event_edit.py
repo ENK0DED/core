@@ -11,23 +11,28 @@ from collections.abc import Callable, Iterable, Iterator
 import copy
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from functools import partial
 from itertools import islice
+from operator import eq
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 from uuid import uuid4
 
 from dateutil.rrule import rrule, rruleset, rrulestr
 from icalendar import Calendar, Event, Timezone, vDDDLists, vDDDTypes, vRecur
 
+from homeassistant.components.calendar import (
+    EVENT_DESCRIPTION,
+    EVENT_END,
+    EVENT_LOCATION,
+    EVENT_RRULE,
+    EVENT_START,
+    EVENT_SUMMARY,
+)
+
 # Rules are walked from their start, which a dense rule makes slow
 MAX_OCCURRENCES = 100_000
 
-SUMMARY = "summary"
-DESCRIPTION = "description"
-LOCATION = "location"
-DTSTART = "dtstart"
-DTEND = "dtend"
-RRULE = "rrule"
-TEXT_FIELDS = (SUMMARY, DESCRIPTION, LOCATION)
+TEXT_FIELDS = (EVENT_SUMMARY, EVENT_DESCRIPTION, EVENT_LOCATION)
 
 type Time = date | datetime
 
@@ -84,14 +89,19 @@ class _Form:
             return cls("date", local)
         return cls("zoned", local, local, str(local))
 
-    def convert(self, value: Time) -> Time | None:
-        """Return a time in this form, None for a date that has no time."""
+    def convert(self, value: Time, at: time | None = None) -> Time | None:
+        """Return a time in this form.
+
+        A date only becomes a time at a given time of day, else it is None.
+        """
         if self.kind == "date":
             if isinstance(value, datetime):
                 return self._local(value).date()
             return value
         if not isinstance(value, datetime):
-            return None
+            if at is None:
+                return None
+            value = datetime.combine(value, at)
         if self.zone is None:
             return self._local(value).replace(tzinfo=None)
         if value.tzinfo is None:
@@ -102,14 +112,20 @@ class _Form:
         """Return a time as a local one, a floating time as it is."""
         return value.astimezone(self.local) if value.tzinfo else value
 
-    def until(self, value: Time) -> Time:
-        """Return the UNTIL of a rule as RFC 5545 has it for this form."""
+    def until(self, value: Time, *, sent: bool = False) -> Time:
+        """Return the UNTIL of a rule as RFC 5545 has it for this form.
+
+        A stored UNTIL of the wrong type is read by its date or wall time, as
+        the coordinator's expansion does. One sent by Home Assistant is local.
+        """
+        if isinstance(value, datetime) and sent:
+            value = self._local(value)
         if self.kind == "date":
             return value.date() if isinstance(value, datetime) else value
         if not isinstance(value, datetime):
             value = datetime.combine(value, time(23, 59, 59))
         if self.zone is None:
-            return self._local(value).replace(tzinfo=None)
+            return value.replace(tzinfo=None)
         return value.replace(tzinfo=value.tzinfo or self.zone).astimezone(UTC)
 
     def until_before(self, cutoff: Time) -> Time:
@@ -237,8 +253,8 @@ def _shown_as(value: Time, shown: Time, local: tzinfo) -> bool:
 
 def _same_times(changes: dict[str, Any], start: Time, end: Time, local: tzinfo) -> bool:
     """Return whether a change keeps the times the frontend showed."""
-    return _shown_as(changes[DTSTART], start, local) and _shown_as(
-        changes[DTEND], end, local
+    return _shown_as(changes[EVENT_START], start, local) and _shown_as(
+        changes[EVENT_END], end, local
     )
 
 
@@ -319,6 +335,7 @@ class _Series:
             raise EditError("event_not_supported")
         self.form = _Form.of(component["DTSTART"], local)
         self.start: Time = component["DTSTART"].dt
+        self.at = self.start.time() if isinstance(self.start, datetime) else None
         self.rules = [vRecur(recur) for recur in _props(component, "RRULE")]
         self.rdates = self._times(start for start, _ in component.rdates)
         self.exdates = self._times(component.exdates)
@@ -329,7 +346,7 @@ class _Series:
         return [
             converted
             for value in values
-            if (converted := self.form.convert(value)) is not None
+            if (converted := self.form.convert(value, self.at)) is not None
         ]
 
     @property
@@ -360,20 +377,20 @@ class _Series:
                 raise EditError("recurrence_too_dense")
             yield value.date() if self.form.kind == "date" else value
 
-    def occurrences(self) -> Iterator[Time]:
+    def occurrences(self, *, excluded: bool = False) -> Iterator[Time]:
         """Yield the occurrences in order, the start always being the first."""
         rule_set = rruleset()
         for rule in self._rules:
             rule_set.rrule(rule)
         for value in (self.start, *self.rdates):
             rule_set.rdate(_as_datetime(value))
-        for value in self.exdates:
+        for value in [] if excluded else self.exdates:
             rule_set.exdate(_as_datetime(value))
         return self._walk(rule_set)
 
-    def contains(self, value: Time) -> bool:
-        """Return whether a time is an occurrence."""
-        return _reaches(self.occurrences(), value, exact=True)
+    def contains(self, value: Time, *, excluded: bool = False) -> bool:
+        """Return whether a time is an occurrence, or an excluded one."""
+        return _reaches(self.occurrences(excluded=excluded), value, exact=True)
 
     def has_occurrence_before(self, cutoff: Time) -> bool:
         """Return whether there is an occurrence before a time."""
@@ -432,17 +449,32 @@ class _EventObject:
         if any("RANGE" in item["RECURRENCE-ID"].params for item in self.overrides):
             raise EditError("event_not_supported")
         self.series = None if self.master is None else _Series(self.master, local)
+        self.at = None if self.series is None else self.series.at
         self.form = (
             self.series.form
             if self.series is not None
             else _Form.of(self.overrides[0]["RECURRENCE-ID"], local)
         )
 
-    def recurrence_id(self, text: str) -> Time:
-        """Return a recurrence id in the form of the event."""
-        if (value := self.form.convert(_parse_time(text))) is None:
-            raise EditError("occurrence_not_found")
-        return value
+    def locate(self, text: str) -> tuple[Time, Event | None, bool]:
+        """Find an occurrence by its recurrence id.
+
+        Return it in the form of the event with its override and whether the
+        series has it. In a skipped hour of a DST change the expansion and
+        dateutil give different instants, so the wall time is tried as well.
+        """
+        value = _parse_time(text)
+        candidates = [self.form.convert(value)]
+        if isinstance(value, datetime) and value.tzinfo and self.form.zone:
+            candidates.append(value.replace(tzinfo=self.form.zone))
+        for rid in candidates:
+            if rid is None:
+                continue
+            override = next(iter(self.overrides_where(partial(eq, rid))), None)
+            in_series = self.series is not None and self.series.contains(rid)
+            if override is not None or in_series:
+                return rid, override, in_series
+        raise EditError("occurrence_not_found")
 
     def override_id(self, override: Event) -> Time | None:
         """Return the recurrence id of an override in the form of the event."""
@@ -462,14 +494,6 @@ class _EventObject:
             self.calendar.subcomponents.remove(component)
             self.overrides.remove(component)
 
-    def find(self, rid: Time) -> tuple[Event | None, bool]:
-        """Return the override of an occurrence and whether the series has it."""
-        override = next(iter(self.overrides_where(lambda value: value == rid)), None)
-        in_series = self.series is not None and self.series.contains(rid)
-        if override is None and not in_series:
-            raise EditError("occurrence_not_found")
-        return override, in_series
-
     def edit_times(
         self,
         component: Event,
@@ -484,7 +508,7 @@ class _EventObject:
             values = []
             for value in (item.dt for item in line.dts):
                 start = value[0] if isinstance(value, tuple) else value
-                converted = self.form.convert(start)
+                converted = self.form.convert(start, self.at)
                 if converted is not None and keep(converted):
                     values.append(self.form.shift(value, delta) if delta else value)
             if values:
@@ -512,11 +536,11 @@ class _EventObject:
 
     def new_rules(self, changes: dict[str, Any], form: _Form) -> list[vRecur] | None:
         """Return the rule sent with a change, with an UNTIL that fits."""
-        if not (text := changes.get(RRULE)):
+        if not (text := changes.get(EVENT_RRULE)):
             return None
         recur = vRecur.from_ical(text)
         if until := recur.get("UNTIL"):
-            recur["UNTIL"] = [form.until(until[0])]
+            recur["UNTIL"] = [form.until(until[0], sent=True)]
         return [recur]
 
     def same_rules(self, rules: list[vRecur]) -> bool:
@@ -545,8 +569,7 @@ def delete_event(
     Return the changed object, None if nothing is left of the event.
     """
     event = _EventObject(calendar, uid, local, now)
-    rid = event.recurrence_id(recurrence_id)
-    _, in_series = event.find(rid)
+    rid, _, in_series = event.locate(recurrence_id)
     if this_and_future:
         event.remove(event.overrides_where(lambda value: value >= rid))
     else:
@@ -582,12 +605,11 @@ def update_event(
         if master is None or series is None:
             raise EditError("occurrences_without_series")
         return _change_from(event, master, series, series.start, None, changes)
-    rid = event.recurrence_id(recurrence_id)
-    override, _ = event.find(rid)
+    rid, override, _ = event.locate(recurrence_id)
     if not this_and_future and (series is None or series.recurs or event.overrides):
         return _change_occurrence(event, rid, override, changes)
-    if master is None or series is None:
-        # Occurrences without a main component have no rule to split
+    if master is None or series is None or not series.contains(rid, excluded=True):
+        # Occurrences that no rule makes can't start a series
         raise EditError("occurrences_without_series")
     return _change_from(event, master, series, rid, override, changes)
 
@@ -615,12 +637,12 @@ def _change_occurrence(
     _set_fields(override, changes)
     start, end = _span(override)
     if not _same_times(changes, start, end, event.local):
-        if isinstance(changes[DTSTART], datetime) != isinstance(start, datetime):
+        if isinstance(changes[EVENT_START], datetime) != isinstance(start, datetime):
             raise EditError("all_day_change_not_supported")
         _write_times(
             override,
-            changes[DTSTART],
-            changes[DTEND],
+            changes[EVENT_START],
+            changes[EVENT_END],
             _Form.of(override["DTSTART"], event.local),
         )
     _touch(override, event.now)
@@ -642,7 +664,7 @@ def _change_from(
     if not series.recurs and not event.overrides:
         return _change_single(event, master, changes)
     form, local = event.form, event.local
-    start, end = changes[DTSTART], changes[DTEND]
+    start, end = changes[EVENT_START], changes[EVENT_END]
     master_start, master_end = _span(master)
     duration = _between(master_start, master_end)
     shown_start, shown_end = (
@@ -652,7 +674,8 @@ def _change_from(
     delta: timedelta | None = None
     new_start, new_end = rid, rid + duration
     if moved:
-        delta = form.delta(start, shown_start)
+        # As local_calendar, the series starts at the time sent
+        delta = form.delta(start, rid)
         new_start = form.shift(rid, delta)
         new_end = new_start + _between(start, end)
     rules = event.new_rules(changes, form)
@@ -771,7 +794,7 @@ def _change_single(
 ) -> EditResult:
     """Change an event that doesn't recur, which may make it recur."""
     _set_fields(master, changes)
-    start, end = changes[DTSTART], changes[DTEND]
+    start, end = changes[EVENT_START], changes[EVENT_END]
     shown_start, shown_end = _span(master)
     form = _Form.of(master["DTSTART"], event.local)
     if not _same_times(changes, shown_start, shown_end, event.local):

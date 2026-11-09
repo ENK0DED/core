@@ -314,24 +314,23 @@ async def test_supported_features(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.parametrize(
-    ("etag", "schedule_tag", "if_match"),
+    ("etag", "props", "if_match"),
     [
-        pytest.param('"etag-1"', None, True, id="etag"),
-        pytest.param('W/"etag-1"', None, False, id="weak_etag"),
-        pytest.param(None, None, False, id="no_etag"),
-        pytest.param(None, '"tag-1"', True, id="schedule_tag"),
+        pytest.param('"etag-1"', {}, True, id="etag"),
+        pytest.param('W/"etag-1"', {}, False, id="weak_etag"),
+        pytest.param(None, {}, False, id="no_etag"),
+        pytest.param(None, {cdav.ScheduleTag.tag: '"tag-1"'}, True, id="schedule_tag"),
     ],
 )
 async def test_delete_event(
     ws_client: ClientFixture,
     calendars: list[Mock],
     item: Event,
-    schedule_tag: str | None,
+    props: dict[str, str],
     if_match: bool,
 ) -> None:
     """Test deleting a whole event, only if it wasn't changed since it was read."""
-    if schedule_tag is not None:
-        item.props[cdav.ScheduleTag.tag] = schedule_tag
+    item.props.update(props)
     search_calls = calendars[0].search.call_count
 
     resp = await _send(ws_client, "delete", "daily")
@@ -472,6 +471,35 @@ async def test_delete_event(
             "THISANDFUTURE",
             id="this_and_future_keeps_earlier_override",
         ),
+        pytest.param(
+            _daily("RRULE:FREQ=DAILY;COUNT=6\nEXDATE;VALUE=DATE:20261111"),
+            "daily",
+            "2026-11-14 10:00:00+01:00",
+            "THISANDFUTURE",
+            id="this_and_future_keeps_date_exclusion",
+        ),
+        pytest.param(
+            _ics(
+                DAILY.format(rule="RRULE:FREQ=DAILY;COUNT=5")
+                .replace("20261110T100000", "20270326T023000")
+                .replace("20261110T110000", "20270326T033000")
+            ),
+            "daily",
+            "2027-03-28 02:30:00+02:00",
+            "",
+            id="skipped_hour",
+        ),
+        pytest.param(
+            _ics(
+                DAILY.format(rule="RRULE:FREQ=DAILY;COUNT=20").replace(
+                    "20261110T", "20261020T"
+                )
+            ),
+            "daily",
+            "2026-11-02 10:00:00+01:00",
+            "THISANDFUTURE",
+            id="this_and_future_after_dst_change",
+        ),
     ],
 )
 async def test_delete_occurrences(
@@ -596,21 +624,21 @@ async def test_delete_last_occurrences(
             ),
             "daily",
             "2026-11-12 10:00:00+01:00",
-            "The event repeats in a way that Home Assistant can't change",
+            "The event uses iCalendar features that Home Assistant can't change",
             id="range_override",
         ),
         pytest.param(
             _daily("RRULE:FREQ=DAILY;COUNT=5\nEXRULE:FREQ=WEEKLY"),
             "daily",
             "2026-11-12 10:00:00+01:00",
-            "The event repeats in a way that Home Assistant can't change",
+            "The event uses iCalendar features that Home Assistant can't change",
             id="exrule",
         ),
         pytest.param(
             _daily("RRULE:FREQ=DAILY;SKIP=FORWARD"),
             "daily",
             "2026-11-12 10:00:00+01:00",
-            "The event repeats in a way that Home Assistant can't change",
+            "The event uses iCalendar features that Home Assistant can't change",
             id="unknown_rule_part",
         ),
         pytest.param(
@@ -759,6 +787,17 @@ async def test_delete_errors(
                 "rrule": "FREQ=WEEKLY;UNTIL=20261231",
             },
             id="add_rule",
+        ),
+        pytest.param(
+            _single(";VALUE=DATE:20261110", "DTEND;VALUE=DATE:20261111"),
+            None,
+            {
+                "summary": "Single",
+                "dtstart": "2026-11-10",
+                "dtend": "2026-11-11",
+                "rrule": "FREQ=DAILY;UNTIL=20261120T230000Z",
+            },
+            id="add_rule_all_day",
         ),
         pytest.param(
             _single(
@@ -980,6 +1019,28 @@ async def test_update_occurrence(
             id="floating_split",
         ),
         pytest.param(
+            _ics(FLOATING.replace("FREQ=DAILY", "FREQ=DAILY;UNTIL=20261114T080000Z")),
+            "float",
+            "2026-11-12 08:00:00",
+            {
+                "summary": "Float",
+                "dtstart": "2026-11-12T09:00:00",
+                "dtend": "2026-11-12T09:30:00",
+            },
+            id="floating_split_utc_until",
+        ),
+        pytest.param(
+            _daily("RRULE:FREQ=DAILY;COUNT=6\nEXDATE;VALUE=DATE:20261114"),
+            "daily",
+            "2026-11-12 10:00:00+01:00",
+            {
+                "summary": "Daily",
+                "dtstart": "2026-11-12T11:00:00",
+                "dtend": "2026-11-12T12:00:00",
+            },
+            id="split_moves_date_exclusion",
+        ),
+        pytest.param(
             _ics(RDATE_ONLY),
             "dates",
             "2026-11-12 10:00:00+01:00",
@@ -1185,8 +1246,8 @@ async def test_update_whole_series(
                 "dtstart": "2026-11-10T10:00:00",
                 "dtend": "2026-11-10T11:00:00",
             },
-            "The occurrences of this event have no repeat rule, so they can only be"
-            " changed one at a time",
+            "This occurrence isn't part of a repeat rule, so it can only be changed"
+            " on its own",
             id="occurrences_without_series",
         ),
         pytest.param(
@@ -1199,9 +1260,23 @@ async def test_update_whole_series(
                 "dtstart": "2026-11-10T10:00:00",
                 "dtend": "2026-11-10T11:00:00",
             },
-            "The occurrences of this event have no repeat rule, so they can only be"
-            " changed one at a time",
+            "This occurrence isn't part of a repeat rule, so it can only be changed"
+            " on its own",
             id="all_occurrences_without_series",
+        ),
+        pytest.param(
+            _daily("RRULE:FREQ=DAILY;COUNT=5", _override(20, "1500", "1600")),
+            "daily",
+            "2026-11-20 10:00:00+01:00",
+            "THISANDFUTURE",
+            {
+                "summary": "Daily",
+                "dtstart": "2026-11-20T15:00:00",
+                "dtend": "2026-11-20T16:00:00",
+            },
+            "This occurrence isn't part of a repeat rule, so it can only be changed"
+            " on its own",
+            id="occurrence_outside_series",
         ),
         pytest.param(
             _ics(NEW_YORK),
@@ -1240,7 +1315,7 @@ async def test_update_whole_series(
                 "dtstart": "2026-11-10T12:00:00",
                 "dtend": "2026-11-10T13:00:00",
             },
-            "The event repeats in a way that Home Assistant can't change",
+            "The event uses iCalendar features that Home Assistant can't change",
             id="unknown_time_zone",
         ),
     ],
@@ -1305,6 +1380,25 @@ async def test_split_rolled_back(
 
     assert resp["error"] == {"code": "failed", "message": message}
     new_item.delete.assert_called_once_with()
+
+
+async def test_split_creation_fails(
+    ws_client: ClientFixture, calendars: list[Mock], item: Event
+) -> None:
+    """Test that the series stays as it was if the new object can't be created."""
+    calendars[0].add_event.side_effect = PutError("refused")
+
+    resp = await _send(
+        ws_client,
+        "update",
+        "daily",
+        "2026-11-13 10:00:00+01:00",
+        "THISANDFUTURE",
+        SPLIT_EVENT,
+    )
+
+    assert resp["error"]["message"] == "Error communicating with the CalDAV server"
+    item.save.assert_not_called()
 
 
 async def test_split_rollback_fails(
