@@ -44,6 +44,42 @@
     }
   },
   "exceptions": {
+    "all_day_change_not_supported": {
+      "message": "A recurring event can't be changed between all day and a time of day"
+    },
+    "event_changed": {
+      "message": "The event was changed on the CalDAV server in the meantime, reload it and try again"
+    },
+    "event_not_found": {
+      "message": "The event was not found on the CalDAV server"
+    },
+    "event_not_supported": {
+      "message": "The event repeats in a way that Home Assistant can't change"
+    },
+    "occurrence_not_found": {
+      "message": "The occurrence was not found in the event"
+    },
+    "occurrences_without_series": {
+      "message": "The occurrences of this event have no repeat rule, so they can only be changed one at a time"
+    },
+    "recurrence_too_dense": {
+      "message": "The event repeats too often to be changed"
+    },
+    "repeated_hour": {
+      "message": "The time is in the hour that repeats when clocks go back, which the time zone of the event can't store"
+    },
+    "request_error": {
+      "message": "Error communicating with the CalDAV server"
+    },
+    "rrule_on_occurrence": {
+      "message": "A single occurrence of a recurring event can't get a repeat rule of its own"
+    },
+    "split_at_added_date": {
+      "message": "The following occurrences can't be changed from an occurrence that was added to the repeat rule"
+    },
+    "start_not_on_rule": {
+      "message": "The new start doesn't match the repeat rule, change the repeat rule as well"
+    },
     "unexpected_response": {
       "message": "Unexpected response from the CalDAV server"
     }

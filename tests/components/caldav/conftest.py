@@ -1,10 +1,14 @@
 """Test fixtures for caldav."""
 
+from collections.abc import Awaitable, Callable
+from typing import Any
 from unittest.mock import Mock, patch
 
+from aiohttp import ClientWebSocketResponse
 from caldav.lib.url import URL
 import pytest
 from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.typing import WebSocketGenerator
 
 from homeassistant.components.caldav.const import DOMAIN
 from homeassistant.const import (
@@ -14,6 +18,7 @@ from homeassistant.const import (
     CONF_VERIFY_SSL,
     Platform,
 )
+from homeassistant.core import HomeAssistant
 
 TEST_URL = "https://example.com/url-1"
 TEST_USERNAME = "username-1"
@@ -65,3 +70,37 @@ def mock_config_entry() -> MockConfigEntry:
             CONF_VERIFY_SSL: True,
         },
     )
+
+
+class Client:
+    """Test client with helper methods for calendar websocket."""
+
+    def __init__(self, client: ClientWebSocketResponse) -> None:
+        """Initialize Client."""
+        self.client = client
+        self.id = 0
+
+    async def cmd(self, cmd: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send a command and receive the json result."""
+        self.id += 1
+        await self.client.send_json(
+            {"id": self.id, "type": f"calendar/event/{cmd}", **payload}
+        )
+        resp = await self.client.receive_json()
+        assert resp.get("id") == self.id
+        return resp
+
+
+type ClientFixture = Callable[[], Awaitable[Client]]
+
+
+@pytest.fixture
+async def ws_client(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> ClientFixture:
+    """Fixture for creating the test websocket client."""
+
+    async def create_client() -> Client:
+        return Client(await hass_ws_client(hass))
+
+    return create_client
